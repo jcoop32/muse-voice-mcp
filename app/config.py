@@ -62,7 +62,7 @@ class Settings:
 
     # Local Speech-to-Text (faster-whisper)
     whisper_model_size: str = field(
-        default_factory=lambda: os.getenv("WHISPER_MODEL_SIZE", "base.en")
+        default_factory=lambda: os.getenv("WHISPER_MODEL_SIZE", "tiny.en")
     )
     whisper_device: str = field(
         default_factory=lambda: os.getenv("WHISPER_DEVICE", "cpu")
@@ -71,9 +71,14 @@ class Settings:
         default_factory=lambda: os.getenv("WHISPER_COMPUTE_TYPE", "int8")
     )
 
-    # Local Text-to-Speech (piper / kokoro-onnx)
+    # Text-to-Speech (edge neural voice with local piper fallback)
     tts_engine: str = field(
-        default_factory=lambda: os.getenv("TTS_ENGINE", "piper").lower().strip()
+        default_factory=lambda: os.getenv("TTS_ENGINE", "edge").lower().strip()
+    )
+    edge_tts_voice: str = field(
+        default_factory=lambda: os.getenv(
+            "EDGE_TTS_VOICE", "en-US-AndrewMultilingualNeural"
+        )
     )
     piper_voice_model: str = field(
         default_factory=lambda: os.getenv("PIPER_VOICE_MODEL", "en_US-lessac-medium")
@@ -87,15 +92,15 @@ class Settings:
         default_factory=lambda: float(os.getenv("VAD_SPEECH_THRESHOLD", "0.5"))
     )
     vad_silence_duration_ms: int = field(
-        default_factory=lambda: int(os.getenv("VAD_SILENCE_DURATION_MS", "700"))
+        default_factory=lambda: int(os.getenv("VAD_SILENCE_DURATION_MS", "420"))
     )
     vad_min_speech_duration_ms: int = field(
-        default_factory=lambda: int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", "220"))
+        default_factory=lambda: int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", "180"))
     )
 
-    # Filler & Timeout Guards
+    # Filler & Timeout Guards (0.0 disables automatic filler so it never blocks real replies)
     filler_delay_seconds: float = field(
-        default_factory=lambda: float(os.getenv("FILLER_DELAY_SECONDS", "1.25"))
+        default_factory=lambda: float(os.getenv("FILLER_DELAY_SECONDS", "0.0"))
     )
     default_answer_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("DEFAULT_ANSWER_TIMEOUT_SECONDS", "45.0"))

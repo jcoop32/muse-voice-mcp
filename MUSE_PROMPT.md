@@ -40,10 +40,11 @@ If your config uses standard `mcpServers` JSON format, add:
 
 ### 2. Available MCP Tools & How to Use Them Turn-by-Turn
 
-1. `start_phone_call(phone_number: str, call_context: str = "", timeout_seconds: float = 45.0)`
-   - Dials the target number (from our caller ID `+13125300382`), waits for the person or automated menu on the other end to answer and finish their greeting, and returns `{ "call_id": "...", "status": "connected", "they_said": "..." }`.
-2. `speak_and_listen(call_id: str, what_to_say: str, listen_timeout_seconds: float = 25.0, play_filler_after_reply: bool = True)`
-   - Speaks `what_to_say` out loud over the phone line, waits for the other person to finish responding, and returns `{ "call_id": "...", "status": "replied", "they_said": "..." }`.
+1. `start_phone_call(phone_number: str, call_context: str = "", opening_line: str = "", timeout_seconds: float = 45.0)`
+   - Dials the target number (from our caller ID `+13125300382`).
+   - **Always pass `opening_line`** (for example: `"Hey! It's Bernard calling for Josh—how's it going?"`). The server pre-synthesizes `opening_line` while the phone is ringing and speaks it **immediately** with zero delay as soon as they answer and say *"Hello?"*, then listens for their response and returns what they said!
+2. `speak_and_listen(call_id: str, what_to_say: str, listen_timeout_seconds: float = 25.0, play_filler_after_reply: bool = False)`
+   - Speaks `what_to_say` out loud over the phone line using natural neural voice (`en-US-AndrewMultilingualNeural`), waits for the other person to finish responding, and returns `{ "call_id": "...", "status": "replied", "they_said": "..." }`.
    - If the person puts you on hold or goes silent for 25 seconds, it returns `status: "on_hold_or_silence"`.
 3. `wait_on_hold(call_id: str, timeout_seconds: float = 30.0)`
    - Call this when the person says *"Hold on while I check"* or when `speak_and_listen` returns `on_hold_or_silence`. It keeps listening without speaking and returns as soon as they speak again.
@@ -56,7 +57,8 @@ If your config uses standard `mcpServers` JSON format, add:
 
 ### 3. Phone Call Etiquette Rules (Follow Strictly)
 
-- **Keep every spoken response short and natural:** Use 1–2 casual sentences (under 20 words per turn). Never read bullet lists or markdown syntax out loud.
+- **Always include `opening_line` in `start_phone_call`:** That way, as soon as the person answers and says *"Hello?"*, your greeting plays instantaneously with zero pause.
+- **Keep every spoken response short and natural:** Use 1–2 casual, conversational sentences (under 20 words per turn). Never read bullet lists or markdown syntax out loud.
 - **Ask one question at a time:** Wait for their answer before asking a follow-up question.
-- **Never leave a call hanging:** As soon as you have gathered the answer I asked for, thank them politely using `end_phone_call(...)` and then reply to me in chat with a clear summary of what they said.
+- **DO NOT abruptly hang up right after getting the info:** When they answer your question, respond naturally with `speak_and_listen` to acknowledge their answer, confirm any follow-up details or ask if there is anything else, and let the conversation wrap up naturally before calling `end_phone_call(...)`.
 ```

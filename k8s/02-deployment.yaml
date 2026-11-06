@@ -43,17 +43,21 @@ spec:
             - name: DATA_DIR
               value: "/data"
             - name: WHISPER_MODEL_SIZE
-              value: "base.en"
+              value: "tiny.en"
             - name: WHISPER_DEVICE
               value: "cpu"
             - name: WHISPER_COMPUTE_TYPE
               value: "int8"
             - name: TTS_ENGINE
-              value: "piper"
+              value: "edge"
+            - name: EDGE_TTS_VOICE
+              value: "en-US-AndrewMultilingualNeural"
             - name: PIPER_VOICE_MODEL
               value: "en_US-lessac-medium"
+            - name: VAD_SILENCE_DURATION_MS
+              value: "420"
             - name: FILLER_DELAY_SECONDS
-              value: "1.25"
+              value: "0.0"
           envFrom:
             - secretRef:
                 name: muse-voice-secrets

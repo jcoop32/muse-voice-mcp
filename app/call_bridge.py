@@ -139,9 +139,27 @@ class CallSession:
         frames = await self.tts.synthesize_mulaw_frames(cleaned)
         if not frames or (self.websocket is None and self.sip_handle is None):
             return
+
+        # Drain any stale filler items in the outbound queue and preempt active filler playback
+        drained_items: list[OutboundAudioItem | None] = []
+        while not self.outbound_queue.empty():
+            try:
+                queued = self.outbound_queue.get_nowait()
+                if queued is not None and queued.label == "filler":
+                    queued.done_event.set()
+                else:
+                    drained_items.append(queued)
+            except asyncio.QueueEmpty:
+                break
+        for kept in drained_items:
+            await self.outbound_queue.put(kept)
+
+        if self.is_playing_tts:
+            self.abort_current_playback = True
+
         item = OutboundAudioItem(frames_b64=frames, label="muse_turn")
         await self.outbound_queue.put(item)
-        # Wait for the WebSocket sender loop to finish streaming (or call termination)
+        # Wait for the WebSocket/RTP sender loop to finish streaming (or call termination)
         done_wait = asyncio.create_task(item.done_event.wait())
         term_wait = asyncio.create_task(self.call_terminated.wait())
         await asyncio.wait(
@@ -191,6 +209,66 @@ class CallSession:
         if term_task in done:
             return "ended", self.latest_remote_utterance
 
+        return "on_hold_or_silence", ""
+
+    async def wait_for_answer_and_greeting(
+        self,
+        answer_timeout_seconds: float,
+        post_pickup_greeting_seconds: float = 3.2,
+    ) -> tuple[str, str]:
+        """Wait for the call to be answered and for the initial 'Hello?' without dead air.
+
+        Once the line connects (`ws_connected`), waits up to `post_pickup_greeting_seconds`
+        for the callee's initial greeting so we never sit in 45s of silence if they answer quietly.
+        """
+        if self.call_terminated.is_set() or self.status in (
+            "completed",
+            "busy",
+            "no-answer",
+            "failed",
+        ):
+            return "ended", self.latest_remote_utterance
+
+        speech_task = asyncio.create_task(self.human_finished_speaking.wait())
+        connect_task = asyncio.create_task(self.ws_connected.wait())
+        term_task = asyncio.create_task(self.call_terminated.wait())
+
+        done, pending = await asyncio.wait(
+            {speech_task, connect_task, term_task},
+            timeout=answer_timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if speech_task in done:
+            for t in pending:
+                t.cancel()
+            self.human_finished_speaking.clear()
+            return "replied", self.latest_remote_utterance
+
+        if term_task in done:
+            for t in pending:
+                t.cancel()
+            return "ended", self.latest_remote_utterance
+
+        if connect_task in done:
+            # Call was answered! Wait up to post_pickup_greeting_seconds for their "Hello?"
+            greeting_wait = min(answer_timeout_seconds, post_pickup_greeting_seconds)
+            done2, pending2 = await asyncio.wait(
+                {speech_task, term_task},
+                timeout=greeting_wait,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending2:
+                t.cancel()
+            if speech_task in done2:
+                self.human_finished_speaking.clear()
+                return "replied", self.latest_remote_utterance
+            if term_task in done2:
+                return "ended", self.latest_remote_utterance
+            return "connected_silent", ""
+
+        for t in pending:
+            t.cancel()
         return "on_hold_or_silence", ""
 
     async def ingest_mulaw_b64(self, payload_b64: str) -> None:
@@ -272,6 +350,7 @@ class CallBridgeManager:
             engine=settings.tts_engine,
             piper_model=settings.piper_voice_model,
             kokoro_voice=settings.kokoro_voice,
+            edge_voice=settings.edge_tts_voice,
             models_dir=settings.models_dir,
         )
         self.telephony = telephony or TelephonyDriver(settings)
@@ -288,8 +367,9 @@ class CallBridgeManager:
         phone_number: str,
         call_context: str = "",
         timeout_seconds: float | None = None,
+        opening_line: str = "",
     ) -> dict[str, Any]:
-        """Dial an external number, wait for their initial greeting, and return it to Muse."""
+        """Dial an external number, wait for their initial greeting, and optionally speak opening_line immediately."""
         call_id = f"call_{uuid.uuid4().hex[:10]}"
         session = CallSession(
             call_id=call_id,
@@ -300,6 +380,13 @@ class CallBridgeManager:
             tts=self.tts,
         )
         self.sessions[call_id] = session
+
+        # Pre-synthesize opening_line while the call is dialing so there is zero TTS delay on pickup
+        prewarm_task: asyncio.Task[list[str]] | None = None
+        if opening_line.strip():
+            prewarm_task = asyncio.create_task(
+                self.tts.synthesize_mulaw_frames(opening_line.strip())
+            )
 
         if (
             self.settings.telephony_provider == "telnyx_sip"
@@ -334,22 +421,15 @@ class CallBridgeManager:
             else self.settings.default_answer_timeout_seconds
         )
 
-        outcome, greeting = await session.wait_for_remote_reply(
-            timeout_seconds=wait_timeout, arm_filler_on_speech=True
+        outcome, greeting = await session.wait_for_answer_and_greeting(
+            answer_timeout_seconds=wait_timeout,
+            post_pickup_greeting_seconds=2.8 if opening_line.strip() else 3.5,
         )
-        if outcome == "replied":
-            session.status = "connected"
-            return {
-                "call_id": call_id,
-                "status": "connected",
-                "provider": session.provider,
-                "they_said": greeting,
-                "next_action_hint": (
-                    "Call speak_and_listen(call_id, what_to_say) to respond, "
-                    "send_dtmf(call_id, digits) if facing an automated menu, "
-                    "or end_phone_call(call_id, parting_words) when done."
-                ),
-            }
+        if prewarm_task is not None and not prewarm_task.done():
+            try:
+                await prewarm_task
+            except Exception:
+                pass
 
         if outcome == "ended":
             self.persist_session(session)
@@ -361,14 +441,52 @@ class CallBridgeManager:
                 "message": f"Call ended during dialing with status '{session.status}'.",
             }
 
+        # If an opening_line was provided and the line connected, immediately speak it and listen for their reply
+        if opening_line.strip() and outcome in ("replied", "connected_silent"):
+            session.status = "connected"
+            session.human_finished_speaking.clear()
+            await session.enqueue_tts_and_wait(opening_line.strip())
+            reply_outcome, first_reply = await session.wait_for_remote_reply(
+                timeout_seconds=self.settings.default_listen_timeout_seconds,
+                arm_filler_on_speech=False,
+            )
+            return {
+                "call_id": call_id,
+                "status": "connected" if reply_outcome == "replied" else reply_outcome,
+                "provider": session.provider,
+                "initial_greeting": greeting,
+                "opening_line_spoken": opening_line.strip(),
+                "they_said": first_reply or greeting,
+                "next_action_hint": (
+                    "Respond naturally with speak_and_listen(call_id, what_to_say). "
+                    "IMPORTANT: Do NOT hang up immediately after getting the info—acknowledge their answer, "
+                    "ask if there is anything else or wrap up naturally before calling end_phone_call."
+                ),
+            }
+
+        if outcome == "replied":
+            session.status = "connected"
+            return {
+                "call_id": call_id,
+                "status": "connected",
+                "provider": session.provider,
+                "they_said": greeting,
+                "next_action_hint": (
+                    "Call speak_and_listen(call_id, what_to_say) to respond, "
+                    "send_dtmf(call_id, digits) if facing an automated menu. "
+                    "IMPORTANT: Do NOT hang up immediately after getting the info—keep the conversation "
+                    "natural and wrap up politely before calling end_phone_call."
+                ),
+            }
+
         return {
             "call_id": call_id,
             "status": "connected_silent",
             "provider": session.provider,
             "they_said": "",
             "next_action_hint": (
-                "Line connected or ringing with no greeting after timeout. "
-                "Call speak_and_listen(call_id, 'Hello?') or end_phone_call(call_id)."
+                "Line connected with no initial greeting. "
+                "Call speak_and_listen(call_id, 'Hey there!') immediately to greet them."
             ),
         }
 
@@ -377,7 +495,7 @@ class CallBridgeManager:
         call_id: str,
         what_to_say: str,
         listen_timeout_seconds: float | None = None,
-        play_filler_after_reply: bool = True,
+        play_filler_after_reply: bool = False,
     ) -> dict[str, Any]:
         """Speak Muse's line over the phone, wait for the person to reply, and return their words."""
         session = self.get_session(call_id)
@@ -400,6 +518,11 @@ class CallBridgeManager:
                 "call_id": call_id,
                 "status": "replied",
                 "they_said": reply_text,
+                "next_action_hint": (
+                    "Continue the conversation naturally with speak_and_listen(call_id, what_to_say). "
+                    "Do NOT hang up abruptly as soon as you get an answer—acknowledge what they said "
+                    "and let the conversation close naturally before calling end_phone_call."
+                ),
             }
         if outcome == "ended":
             self.persist_session(session)

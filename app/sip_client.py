@@ -139,6 +139,22 @@ def parse_sdp_rtp_target(sdp_body: str) -> tuple[str, int] | None:
     return ip_match.group(1).strip(), int(port_match.group(1))
 
 
+def extract_uas_route_set(header_block: str) -> list[str]:
+    """Extract Record-Route headers from a SIP 200 OK and reverse them per RFC 3261 Section 12.1.2."""
+    routes: list[str] = []
+    for line in header_block.splitlines():
+        if line.lower().startswith("record-route:"):
+            raw_val = line.split(":", 1)[1].strip()
+            # Split multiple comma-separated <sip:...> route entries if present on one line
+            entries = re.findall(r"(?:[^,<]*<[^>]+>[^,]*)", raw_val)
+            if entries:
+                routes.extend(e.strip() for e in entries if e.strip())
+            elif raw_val:
+                routes.append(raw_val)
+    routes.reverse()
+    return routes
+
+
 @dataclass
 class SipCallHandle:
     """Represents a live Outbound SIP + RTP call session."""
@@ -157,6 +173,7 @@ class SipCallHandle:
         self._stop_event = asyncio.Event()
         self._dtmf_queue: asyncio.Queue[str] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
+        self._connected_monotonic: float = 0.0
 
     def start_background(self) -> None:
         self._task = asyncio.create_task(self._run_sip_and_rtp())
@@ -223,7 +240,7 @@ class SipCallHandle:
                 f"CSeq: {cseq} INVITE",
                 f"Contact: {contact_uri}",
                 f"P-Asserted-Identity: <sip:{self.caller_number}@{self.sip_host}>",
-                "User-Agent: MuseVoiceMCP/0.1",
+                "User-Agent: MuseVoiceMCP/0.2",
                 "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS",
                 "Content-Type: application/sdp",
             ]
@@ -232,29 +249,58 @@ class SipCallHandle:
             headers.append(f"Content-Length: {len(sdp_offer.encode('utf-8'))}")
             return ("\r\n".join(headers) + "\r\n\r\n" + sdp_offer).encode("utf-8")
 
-        def build_ack(cseq: int, branch: str, current_to: str, target_contact: str) -> bytes:
+        def build_ack(
+            cseq: int,
+            branch: str,
+            current_to: str,
+            target_contact: str,
+            route_set: list[str] | None = None,
+        ) -> bytes:
             headers = [
                 f"ACK {target_contact} SIP/2.0",
                 f"Via: SIP/2.0/UDP {pub_ip}:{sip_local_port};rport;branch={branch}",
                 "Max-Forwards: 70",
-                f"From: {from_uri}",
-                f"To: {current_to}",
-                f"Call-ID: {self.sip_call_id}",
-                f"CSeq: {cseq} ACK",
-                "Content-Length: 0",
             ]
+            if route_set:
+                for r in route_set:
+                    headers.append(f"Route: {r}")
+            headers.extend(
+                [
+                    f"From: {from_uri}",
+                    f"To: {current_to}",
+                    f"Call-ID: {self.sip_call_id}",
+                    f"CSeq: {cseq} ACK",
+                    f"Contact: {contact_uri}",
+                    "Content-Length: 0",
+                ]
+            )
             return ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8")
 
-        def build_bye(cseq: int, branch: str, current_to: str, target_contact: str, auth_line: str = "") -> bytes:
+        def build_bye(
+            cseq: int,
+            branch: str,
+            current_to: str,
+            target_contact: str,
+            route_set: list[str] | None = None,
+            auth_line: str = "",
+        ) -> bytes:
             headers = [
                 f"BYE {target_contact} SIP/2.0",
                 f"Via: SIP/2.0/UDP {pub_ip}:{sip_local_port};rport;branch={branch}",
                 "Max-Forwards: 70",
-                f"From: {from_uri}",
-                f"To: {current_to}",
-                f"Call-ID: {self.sip_call_id}",
-                f"CSeq: {cseq} BYE",
             ]
+            if route_set:
+                for r in route_set:
+                    headers.append(f"Route: {r}")
+            headers.extend(
+                [
+                    f"From: {from_uri}",
+                    f"To: {current_to}",
+                    f"Call-ID: {self.sip_call_id}",
+                    f"CSeq: {cseq} BYE",
+                    f"Contact: {contact_uri}",
+                ]
+            )
             if auth_line:
                 headers.append(auth_line)
             headers.append("Content-Length: 0")
@@ -265,6 +311,7 @@ class SipCallHandle:
         branch1 = f"z9hG4bK{uuid.uuid4().hex[:12]}"
         remote_rtp_addr: tuple[str, int] | None = None
         remote_contact_uri = request_uri
+        dialog_route_set: list[str] = []
         last_auth_header = ""
         rtp_task: asyncio.Task[None] | None = None
 
@@ -293,17 +340,38 @@ class SipCallHandle:
                 if contact_match:
                     remote_contact_uri = contact_match.group(1).strip()
 
+                # Extract CSeq number & method
+                cseq_m = re.search(r"^CSeq:\s*(\d+)\s+(\w+)", header_block, re.MULTILINE | re.IGNORECASE)
+                resp_cseq_num = int(cseq_m.group(1)) if cseq_m else cseq
+                resp_cseq_method = cseq_m.group(2).upper() if cseq_m else "INVITE"
+
+                # Handle incoming OPTIONS / keepalive from SIP proxy
+                if first_line.startswith("OPTIONS "):
+                    via_m = re.search(r"^(?:Via|v):\s*(.+)$", header_block, re.MULTILINE | re.IGNORECASE)
+                    cseq_raw = re.search(r"^CSeq:\s*(.+)$", header_block, re.MULTILINE | re.IGNORECASE)
+                    ok_opt = (
+                        "SIP/2.0 200 OK\r\n"
+                        f"Via: {via_m.group(1).strip() if via_m else ''}\r\n"
+                        f"From: {current_to_header}\r\n"
+                        f"To: {from_uri}\r\n"
+                        f"Call-ID: {self.sip_call_id}\r\n"
+                        f"CSeq: {cseq_raw.group(1).strip() if cseq_raw else '1 OPTIONS'}\r\n"
+                        "Content-Length: 0\r\n\r\n"
+                    ).encode("utf-8")
+                    sip_sock.sendto(ok_opt, (sip_server_ip, self.sip_port))
+                    continue
+
                 # Handle remote BYE
                 if first_line.startswith("BYE "):
                     via_m = re.search(r"^(?:Via|v):\s*(.+)$", header_block, re.MULTILINE | re.IGNORECASE)
-                    cseq_m = re.search(r"^CSeq:\s*(.+)$", header_block, re.MULTILINE | re.IGNORECASE)
+                    cseq_raw = re.search(r"^CSeq:\s*(.+)$", header_block, re.MULTILINE | re.IGNORECASE)
                     ok_reply = (
                         "SIP/2.0 200 OK\r\n"
                         f"Via: {via_m.group(1).strip() if via_m else ''}\r\n"
-                        f"From: { current_to_header }\r\n"
+                        f"From: {current_to_header}\r\n"
                         f"To: {from_uri}\r\n"
                         f"Call-ID: {self.sip_call_id}\r\n"
-                        f"CSeq: {cseq_m.group(1).strip() if cseq_m else '1 BYE'}\r\n"
+                        f"CSeq: {cseq_raw.group(1).strip() if cseq_raw else '1 BYE'}\r\n"
                         "Content-Length: 0\r\n\r\n"
                     ).encode("utf-8")
                     sip_sock.sendto(ok_reply, (sip_server_ip, self.sip_port))
@@ -315,8 +383,7 @@ class SipCallHandle:
                     continue
                 code = int(status_m.group(1))
 
-                if code in (401, 407) and cseq == 1:
-                    # Acknowledge challenge and send authenticated INVITE
+                if code in (401, 407) and cseq == 1 and resp_cseq_method == "INVITE":
                     sip_sock.sendto(
                         build_ack(cseq, branch1, current_to_header, request_uri),
                         (sip_server_ip, self.sip_port),
@@ -343,25 +410,35 @@ class SipCallHandle:
                             build_invite(cseq, branch2, last_auth_header),
                             (sip_server_ip, self.sip_port),
                         )
-                elif code in (180, 183):
+                elif code in (180, 183) and resp_cseq_method == "INVITE":
+                    # Start RTP NAT hole-punching during ringing, but DO NOT transcribe ringback audio
                     target = parse_sdp_rtp_target(body)
                     if target and rtp_task is None:
                         remote_rtp_addr = target
                         rtp_task = asyncio.create_task(
                             self._run_rtp_loop(rtp_sock, remote_rtp_addr)
                         )
-                elif code == 200:
-                    sip_sock.sendto(
-                        build_ack(
-                            cseq,
-                            f"z9hG4bK{uuid.uuid4().hex[:12]}",
-                            to_tag or current_to_header,
-                            remote_contact_uri,
-                        ),
-                        (sip_server_ip, self.sip_port),
+                elif code == 200 and resp_cseq_method == "INVITE":
+                    routes = extract_uas_route_set(header_block)
+                    if routes:
+                        dialog_route_set = routes
+                    # Always ACK 200 OK (including any UDP retransmissions) with full Route set
+                    ack_pkt = build_ack(
+                        resp_cseq_num,
+                        f"z9hG4bK{uuid.uuid4().hex[:12]}",
+                        to_tag or current_to_header,
+                        remote_contact_uri,
+                        route_set=dialog_route_set,
                     )
-                    self.session.status = "connected"
-                    self.session.ws_connected.set()
+                    sip_sock.sendto(ack_pkt, (sip_server_ip, self.sip_port))
+
+                    if self.session.status != "connected":
+                        self._connected_monotonic = time.monotonic()
+                        self.session.utterance_tracker.reset()
+                        self.session.status = "connected"
+                        self.session.ws_connected.set()
+                        logger.info("[call_id=%s] SIP 200 OK answered; call connected!", self.call_id)
+
                     target = parse_sdp_rtp_target(body)
                     if target:
                         remote_rtp_addr = target
@@ -369,9 +446,9 @@ class SipCallHandle:
                         rtp_task = asyncio.create_task(
                             self._run_rtp_loop(rtp_sock, remote_rtp_addr)
                         )
-                elif code >= 400:
+                elif code >= 400 and resp_cseq_method == "INVITE":
                     sip_sock.sendto(
-                        build_ack(cseq, branch1, current_to_header, request_uri),
+                        build_ack(resp_cseq_num, branch1, current_to_header, request_uri),
                         (sip_server_ip, self.sip_port),
                     )
                     final_state = "busy" if code == 486 else "failed"
@@ -384,14 +461,15 @@ class SipCallHandle:
                     self.session.mark_terminated(final_state)
                     break
 
-            # Send BYE or CANCEL if stopped locally
+            # Send BYE if stopped locally
             if self.session.status == "connected" and to_tag:
                 bye_pkt = build_bye(
                     cseq + 1,
                     f"z9hG4bK{uuid.uuid4().hex[:12]}",
                     to_tag,
                     remote_contact_uri,
-                    last_auth_header,
+                    route_set=dialog_route_set,
+                    auth_line=last_auth_header,
                 )
                 sip_sock.sendto(bye_pkt, (sip_server_ip, self.sip_port))
         finally:
@@ -421,6 +499,11 @@ class SipCallHandle:
                 except Exception:
                     break
                 if len(pkt) <= 12:
+                    continue
+                # Ignore early-media ringback tones (180/183) before SIP 200 OK + 300ms pickup settle
+                if self.session.status != "connected":
+                    continue
+                if self._connected_monotonic > 0 and (time.monotonic() - self._connected_monotonic) < 0.30:
                     continue
                 pt = pkt[1] & 0x7F
                 # Payload Type 0 = PCMU 8000Hz

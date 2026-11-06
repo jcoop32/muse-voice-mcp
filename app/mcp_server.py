@@ -18,9 +18,11 @@ def create_mcp_server(bridge_manager: CallBridgeManager) -> FastMCP:
         "MuseVoiceBridge",
         instructions=(
             "Use these tools to place outbound phone calls on behalf of the user, "
-            "speak to businesses/receptionists, navigate keypad menus, gather answers, "
-            "and hang up politely. Keep every spoken sentence concise (under 20 words) "
-            "and ask one clear question at a time."
+            "speak to people or businesses, navigate keypad menus, gather answers, "
+            "and wrap up conversations naturally. Keep every spoken sentence concise "
+            "and conversational (under 20 words), pass `opening_line` in `start_phone_call` "
+            "for instant zero-delay greeting on pickup, and NEVER abruptly hang up immediately "
+            "after receiving an answer—acknowledge their reply and wrap up naturally before calling `end_phone_call`."
         ),
     )
 
@@ -28,13 +30,15 @@ def create_mcp_server(bridge_manager: CallBridgeManager) -> FastMCP:
     async def start_phone_call(
         phone_number: str,
         call_context: str = "",
+        opening_line: str = "",
         timeout_seconds: float = 45.0,
     ) -> dict[str, Any]:
-        """Dial an external phone number (E.164 or 10-digit US), wait for them to answer and greet you, and return what they said."""
+        """Dial an external phone number (E.164 or 10-digit US), wait for them to answer, optionally speak `opening_line` immediately with zero delay, and return what they said."""
         return await bridge_manager.start_call(
             phone_number=phone_number,
             call_context=call_context,
             timeout_seconds=timeout_seconds,
+            opening_line=opening_line,
         )
 
     @mcp.tool()
@@ -42,7 +46,7 @@ def create_mcp_server(bridge_manager: CallBridgeManager) -> FastMCP:
         call_id: str,
         what_to_say: str,
         listen_timeout_seconds: float = 25.0,
-        play_filler_after_reply: bool = True,
+        play_filler_after_reply: bool = False,
     ) -> dict[str, Any]:
         """Speak your message on the active phone call, wait for the other person to finish replying, and return their transcribed response."""
         return await bridge_manager.speak_and_listen(

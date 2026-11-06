@@ -6,6 +6,7 @@ mcp>=1.2.0
 pydantic>=2.9.0
 python-multipart>=0.0.12
 faster-whisper>=1.1.0
+edge-tts>=6.1.12
 pytest>=8.3.0
 pytest-asyncio>=0.24.0
 

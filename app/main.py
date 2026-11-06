@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import logging
 from typing import Any
 
@@ -24,13 +26,17 @@ logger = logging.getLogger(__name__)
 class StartCallRequest(BaseModel):
     phone_number: str = Field(..., description="Target phone number in E.164 or 10-digit format")
     call_context: str = Field(default="", description="Goal/context for the call")
+    opening_line: str = Field(
+        default="",
+        description="Optional opening line to pre-synthesize while ringing and speak immediately upon pickup",
+    )
     timeout_seconds: float = Field(default=45.0, ge=1.0, le=120.0)
 
 
 class SpeakAndListenRequest(BaseModel):
     what_to_say: str = Field(..., min_length=1, description="Sentence to speak on the call")
     listen_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
-    play_filler_after_reply: bool = Field(default=True)
+    play_filler_after_reply: bool = Field(default=False)
 
 
 class HoldRequest(BaseModel):
@@ -57,10 +63,19 @@ def create_app(
     manager = bridge_manager or CallBridgeManager(cfg)
     mcp_server = create_mcp_server(manager)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if manager.stt.custom_transcribe_fn is None:
+            asyncio.create_task(asyncio.to_thread(manager.stt.warmup))
+        if manager.tts._custom_synth_fn is None:
+            asyncio.create_task(manager.tts.synthesize_mulaw_frames("Hey there!"))
+        yield
+
     app = FastAPI(
         title="Muse Voice MCP Bridge",
-        version="0.1.0",
+        version="0.2.0",
         description="Self-hosted Outbound Phone Call 'Ears & Mouth' MCP Bridge for Muse",
+        lifespan=lifespan,
     )
     app.state.settings = cfg
     app.state.bridge_manager = manager
@@ -177,6 +192,7 @@ def create_app(
             phone_number=req.phone_number,
             call_context=req.call_context,
             timeout_seconds=req.timeout_seconds,
+            opening_line=req.opening_line,
         )
 
     @app.post("/api/v1/calls/{call_id}/speak")

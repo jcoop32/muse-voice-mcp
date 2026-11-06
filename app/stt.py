@@ -1,9 +1,10 @@
-"""Local Speech-to-Text engine powered by faster-whisper."""
+"""Local Speech-to-Text engine powered by faster-whisper with low-latency CPU tuning."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -11,13 +12,40 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Patterns of Whisper noise/ringtone hallucinations to ignore
+_HALLUCINATION_RE = re.compile(
+    r"^(?:(?:ee|ah|oh|uh|um|mm|hm|la|da)\s*){4,}$", re.IGNORECASE
+)
+_HALLUCINATION_PHRASES = (
+    "thank you for watching",
+    "thanks for watching",
+    "subtitles by",
+    "amara.org",
+)
+
+
+def is_hallucinated_transcript(text: str) -> bool:
+    """Return True if Whisper output is a ringtone/silence hallucination (e.g. 'ee ee ee...')."""
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+    if _HALLUCINATION_RE.match(cleaned):
+        return True
+    lower = cleaned.lower()
+    if any(p in lower for p in _HALLUCINATION_PHRASES):
+        return True
+    words = lower.split()
+    if len(words) >= 6 and len(set(words)) == 1:
+        return True
+    return False
+
 
 class LocalWhisperSTT:
-    """Lazy-loaded faster-whisper transcriber cached on Longhorn persistent storage."""
+    """Low-latency faster-whisper transcriber cached on Longhorn persistent storage."""
 
     def __init__(
         self,
-        model_size: str = "base.en",
+        model_size: str = "tiny.en",
         device: str = "cpu",
         compute_type: str = "int8",
         download_root: Path | None = None,
@@ -47,8 +75,22 @@ class LocalWhisperSTT:
             self.model_size,
             device=self.device,
             compute_type=self.compute_type,
+            cpu_threads=4,
+            num_workers=1,
             download_root=root,
         )
+
+    def warmup(self) -> None:
+        """Pre-load the Whisper model into RAM at server startup so the first call has zero load delay."""
+        if self._custom_transcribe_fn is not None:
+            return
+        try:
+            self._ensure_model()
+            dummy = np.zeros(8000, dtype=np.float32)
+            self.transcribe_sync(dummy)
+            logger.info("Pre-warmed faster-whisper (%s) successfully.", self.model_size)
+        except Exception as exc:
+            logger.warning("Whisper warmup skipped: %s", exc)
 
     def transcribe_sync(self, audio_16k_f32: np.ndarray) -> str:
         """Synchronously transcribe 16kHz float32 mono audio into text."""
@@ -64,11 +106,18 @@ class LocalWhisperSTT:
             beam_size=1,
             best_of=1,
             temperature=0.0,
+            without_timestamps=True,
+            max_new_tokens=64,
+            no_speech_threshold=0.6,
+            repetition_penalty=1.2,
             condition_on_previous_text=False,
             vad_filter=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
-        return text.strip()
+        text = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+        if is_hallucinated_transcript(text):
+            logger.debug("Filtered Whisper noise hallucination: %r", text[:80])
+            return ""
+        return text
 
     async def transcribe(self, audio_16k_f32: np.ndarray) -> str:
         """Non-blocking async wrapper around faster-whisper transcription."""

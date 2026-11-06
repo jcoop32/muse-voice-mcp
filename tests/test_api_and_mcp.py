@@ -12,8 +12,12 @@ from app.audio_codec import pcm16_to_mulaw_b64_frames
 from app.call_bridge import CallBridgeManager
 from app.config import Settings
 from app.main import create_app
-from app.sip_client import compute_sip_digest_header, parse_sdp_rtp_target
-from app.stt import LocalWhisperSTT
+from app.sip_client import (
+    compute_sip_digest_header,
+    extract_uas_route_set,
+    parse_sdp_rtp_target,
+)
+from app.stt import LocalWhisperSTT, is_hallucinated_transcript
 from app.tts import LocalTTSEngine
 
 
@@ -136,5 +140,23 @@ def test_sip_digest_auth_and_sdp_parser() -> None:
         "m=audio 24680 RTP/AVP 0 101\r\n"
     )
     assert parse_sdp_rtp_target(sdp) == ("64.16.250.10", 24680)
+
+    sip_200_headers = (
+        "SIP/2.0 200 OK\r\n"
+        "Record-Route: <sip:proxy2.telnyx.com;lr>, <sip:proxy1.telnyx.com;lr>\r\n"
+    )
+    routes = extract_uas_route_set(sip_200_headers)
+    assert routes == [
+        "<sip:proxy1.telnyx.com;lr>",
+        "<sip:proxy2.telnyx.com;lr>",
+    ]
+
+
+def test_ringback_hallucination_filter() -> None:
+    assert is_hallucinated_transcript("ee ee ee ee ee ee") is True
+    assert is_hallucinated_transcript("Thank you for watching!") is True
+    assert is_hallucinated_transcript("Hello?") is False
+    assert is_hallucinated_transcript("Going good, how are you?") is False
+
 
 
