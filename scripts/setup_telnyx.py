@@ -61,9 +61,8 @@ class TelnyxProvisioner:
             "/outbound_voice_profiles",
             json={
                 "name": name,
-                "Enabled": True,
+                "enabled": True,
                 "traffic_type": "conversational",
-                "service_plan": "us",
                 "whitelisted_destinations": ["US", "CA"],
             },
         )
