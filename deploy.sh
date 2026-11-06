@@ -37,12 +37,8 @@ cat <<EOF
    kubectl apply -f k8s/03-service.yaml
    kubectl rollout restart deployment/muse-voice-mcp -n default
 
-3. Add Public Hostname Route in Cloudflare Zero Trust (shared cloudflared tunnel):
-   - Subdomain: voice-mcp.cooperlabs.app
-   - Service:   http://muse-voice-mcp-svc.default.svc.cluster.local:8090
-
-4. Connect Muse MCP Client:
-   - In-Cluster URL:  http://muse-voice-mcp-svc.default.svc.cluster.local:8090/mcp/sse
-   - Tailscale Mesh:  http://<k3s-node-tailscale-ip>:30890/mcp/sse
-   - Public HTTPS:    https://voice-mcp.cooperlabs.app/mcp/sse
+3. Connect Muse MCP Client (Direct Tailscale Mesh / In-Cluster — No Cloudflare Required):
+   - Tailscale Mesh URL:  http://100.115.252.55:30890/mcp/sse
+   - ClusterIP DNS URL:   http://muse-voice-mcp-svc.default.svc.cluster.local:8090/mcp/sse
+   - ClusterIP Direct:    http://10.43.235.143:8090/mcp/sse
 EOF
