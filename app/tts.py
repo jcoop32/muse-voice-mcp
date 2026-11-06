@@ -91,10 +91,28 @@ class LocalTTSEngine:
         return pcm16, int(sample_rate)
 
     def _synth_with_piper(self, text: str) -> tuple[np.ndarray, int]:
+        models_dir = self.models_dir or Path("/tmp/muse-voice-data/models")
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_onnx = models_dir / f"{self.piper_model}.onnx"
+        model_json = models_dir / f"{self.piper_model}.onnx.json"
+
+        # If piper CLI binary is installed, auto-fetch the ONNX voice model if missing and run piper CLI
+        piper_bin = shutil.which("piper")
+        if piper_bin:
+            if not model_onnx.exists() or not model_json.exists():
+                self._download_piper_voice(model_onnx, model_json)
+            proc = subprocess.run(
+                [piper_bin, "--model", str(model_onnx), "--output_file", "-"],
+                input=text.encode("utf-8"),
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            return self._decode_wav_bytes(proc.stdout)
+
         if self._piper_voice is None:
             from piper.voice import PiperVoice
 
-            model_onnx = (self.models_dir or Path(".")) / f"{self.piper_model}.onnx"
             if not model_onnx.exists():
                 raise FileNotFoundError(f"Piper model not found at {model_onnx}")
             self._piper_voice = PiperVoice.load(str(model_onnx))
@@ -103,6 +121,18 @@ class LocalTTSEngine:
         with wave.open(buf, "wb") as wav_file:
             self._piper_voice.synthesize(text, wav_file)
         return self._decode_wav_bytes(buf.getvalue())
+
+    @staticmethod
+    def _download_piper_voice(model_onnx: Path, model_json: Path) -> None:
+        import urllib.request
+
+        base_url = (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            "en/en_US/lessac/medium/en_US-lessac-medium"
+        )
+        logger.info("Downloading Piper neural voice model to %s ...", model_onnx)
+        urllib.request.urlretrieve(f"{base_url}.onnx", str(model_onnx))
+        urllib.request.urlretrieve(f"{base_url}.onnx.json", str(model_json))
 
     def _synth_with_espeak(self, text: str) -> tuple[np.ndarray, int]:
         proc = subprocess.run(

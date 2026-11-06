@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     espeak-ng \
     ffmpeg \
     libsndfile1 \
+    && curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz \
+       | tar -xz -C /usr/local/share \
+    && ln -s /usr/local/share/piper/piper /usr/local/bin/piper \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root runtime user (uid 1000) and persistent data mount point
