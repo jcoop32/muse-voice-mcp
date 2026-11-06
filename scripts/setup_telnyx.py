@@ -115,7 +115,9 @@ class TelnyxProvisioner:
         resp.raise_for_status()
         return resp.json().get("data", [])
 
-    def search_available_numbers(self, area_code: str, limit: int = 5) -> list[str]:
+    def search_available_numbers(
+        self, area_code: str, limit: int = 5, max_monthly_cost: float = 1.00
+    ) -> list[str]:
         params = {
             "filter[country_code]": "US",
             "filter[national_destination_code]": area_code,
@@ -124,7 +126,14 @@ class TelnyxProvisioner:
         }
         resp = self.client.get("/available_phone_numbers", params=params)
         resp.raise_for_status()
-        return [item["phone_number"] for item in resp.json().get("data", [])]
+        results: list[str] = []
+        for item in resp.json().get("data", []):
+            cost = item.get("cost_information", {})
+            monthly = float(cost.get("monthly_cost", "1.0"))
+            upfront = float(cost.get("upfront_cost", "1.0"))
+            if monthly <= max_monthly_cost and upfront <= max_monthly_cost:
+                results.append(item["phone_number"])
+        return results
 
     def purchase_number(self, phone_number: str, connection_id: str) -> dict[str, Any]:
         resp = self.client.post(
@@ -136,6 +145,10 @@ class TelnyxProvisioner:
         )
         resp.raise_for_status()
         return resp.json().get("data", {})
+
+    def release_number(self, number_id: str) -> None:
+        resp = self.client.delete(f"/phone_numbers/{number_id}")
+        resp.raise_for_status()
 
     def bind_number_to_connection(self, number_id: str, connection_id: str) -> None:
         resp = self.client.patch(
@@ -199,6 +212,8 @@ def main() -> int:
     parser.add_argument("--api-key", default=os.getenv("TELNYX_API_KEY", ""), help="Telnyx API v2 Key (KEY019...)")
     parser.add_argument("--number", default=os.getenv("OUTBOUND_CALLER_NUMBER", ""), help="Existing Telnyx E.164 phone number (+1...)")
     parser.add_argument("--buy-area-code", default="", help="Optional 3-digit US area code to search and purchase a $1/mo number")
+    parser.add_argument("--swap-to-area-code", default="", help="Release existing expensive number(s) and swap to a verified $1.00/mo number in this area code (e.g. 773 or 872)")
+    parser.add_argument("--release-number", default="", help="Release a specific owned phone number (+1...) immediately so it never renews")
     parser.add_argument("--domain", default="voice-mcp.cooperlabs.app", help="Public Cloudflare Tunnel domain")
     args = parser.parse_args()
 
@@ -225,18 +240,45 @@ def main() -> int:
     owned = prov.list_owned_numbers()
     chosen_number = args.number.strip()
 
-    if owned:
+    if args.release_number:
+        rel = args.release_number.strip()
+        for num_obj in list(owned):
+            if num_obj.get("phone_number") == rel:
+                prov.release_number(str(num_obj["id"]))
+                print(f"    Released {rel} (will not renew next month)!")
+                owned.remove(num_obj)
+
+    if args.swap_to_area_code:
+        candidates = prov.search_available_numbers(args.swap_to_area_code, limit=3, max_monthly_cost=1.00)
+        if not candidates:
+            print(
+                f"Error: No <=$1.00/mo numbers found in area code {args.swap_to_area_code}. Existing number kept safe.",
+                file=sys.stderr,
+            )
+            return 1
+        for num_obj in list(owned):
+            old_num = num_obj.get("phone_number")
+            prov.release_number(str(num_obj["id"]))
+            print(f"    Released old number {old_num}!")
+        chosen_number = candidates[0]
+        print(f"    Purchasing verified $1.00/mo number {chosen_number} and binding to {connection_id}...")
+        prov.purchase_number(chosen_number, connection_id)
+        print(f"    Purchased and bound {chosen_number}!")
+    elif owned:
         target = next((n for n in owned if n.get("phone_number") == chosen_number), owned[0])
         chosen_number = target["phone_number"]
         prov.bind_number_to_connection(str(target["id"]), connection_id)
         print(f"    Bound owned number {chosen_number} to TeXML App {connection_id}!")
     elif args.buy_area_code:
-        candidates = prov.search_available_numbers(args.buy_area_code, limit=3)
+        candidates = prov.search_available_numbers(args.buy_area_code, limit=3, max_monthly_cost=1.00)
         if not candidates:
-            print(f"No available numbers found in area code {args.buy_area_code}.", file=sys.stderr)
+            print(
+                f"Error: No <=$1.00/mo numbers found in area code {args.buy_area_code} (area code may charge a $5 premium). Try 773 or 872.",
+                file=sys.stderr,
+            )
             return 1
         chosen_number = candidates[0]
-        print(f"    Purchasing {chosen_number} ($1.00/mo) and binding to {connection_id}...")
+        print(f"    Purchasing verified $1.00/mo number {chosen_number} and binding to {connection_id}...")
         prov.purchase_number(chosen_number, connection_id)
         print(f"    Purchased and bound {chosen_number}!")
     else:
