@@ -12,6 +12,7 @@ from app.audio_codec import pcm16_to_mulaw_b64_frames
 from app.call_bridge import CallBridgeManager
 from app.config import Settings
 from app.main import create_app
+from app.sip_client import compute_sip_digest_header, parse_sdp_rtp_target
 from app.stt import LocalWhisperSTT
 from app.tts import LocalTTSEngine
 
@@ -112,4 +113,28 @@ async def test_mcp_tools_registered_and_callable(tmp_path: Path) -> None:
         "send_dtmf",
         "end_phone_call",
     }.issubset(tool_names)
+
+
+def test_sip_digest_auth_and_sdp_parser() -> None:
+    hdr = compute_sip_digest_header(
+        header_name="Proxy-Authorization",
+        challenge_value='realm="sip.telnyx.com", nonce="12345abcdef", qop="auth"',
+        username="tz8cdz6s4w8x",
+        password="secret",
+        method="INVITE",
+        uri="sip:+15551234567@sip.telnyx.com",
+    )
+    assert hdr.startswith("Proxy-Authorization: Digest ")
+    assert 'username="tz8cdz6s4w8x"' in hdr
+    assert 'realm="sip.telnyx.com"' in hdr
+    assert "qop=auth" in hdr
+
+    sdp = (
+        "v=0\r\n"
+        "o=Telnyx 1 1 IN IP4 64.16.250.10\r\n"
+        "c=IN IP4 64.16.250.10\r\n"
+        "m=audio 24680 RTP/AVP 0 101\r\n"
+    )
+    assert parse_sdp_rtp_target(sdp) == ("64.16.250.10", 24680)
+
 

@@ -16,8 +16,9 @@ from fastapi import WebSocket
 
 from app.audio_codec import mulaw_b64_to_float32_16k
 from app.config import Settings
+from app.sip_client import SipCallHandle
 from app.stt import LocalWhisperSTT
-from app.telephony import TelephonyDriver
+from app.telephony import TelephonyDriver, normalize_phone_number
 from app.tts import LocalTTSEngine
 from app.vad import UtteranceTracker
 
@@ -80,6 +81,7 @@ class CallSession:
         self.is_playing_tts: bool = False
         self.abort_current_playback: bool = False
         self.websocket: WebSocket | None = None
+        self.sip_handle: SipCallHandle | None = None
         self._filler_task: asyncio.Task[None] | None = None
 
         self.utterance_tracker = UtteranceTracker(
@@ -135,7 +137,7 @@ class CallSession:
             return
         self.record_turn("muse", cleaned)
         frames = await self.tts.synthesize_mulaw_frames(cleaned)
-        if not frames or self.websocket is None:
+        if not frames or (self.websocket is None and self.sip_handle is None):
             return
         item = OutboundAudioItem(frames_b64=frames, label="muse_turn")
         await self.outbound_queue.put(item)
@@ -299,9 +301,32 @@ class CallBridgeManager:
         )
         self.sessions[call_id] = session
 
-        dial_info = await self.telephony.dial_outbound(call_id, phone_number)
-        session.provider = dial_info["provider"]
-        session.provider_call_id = dial_info["provider_call_id"]
+        if (
+            self.settings.telephony_provider == "telnyx_sip"
+            and self.settings.telnyx_sip_username
+            and self.settings.telnyx_sip_password
+        ):
+            normalized_to = normalize_phone_number(phone_number)
+            sip_cid = f"{uuid.uuid4().hex}@muse-voice-mcp"
+            handle = SipCallHandle(
+                call_id=call_id,
+                sip_call_id=sip_cid,
+                session=session,
+                sip_host=self.settings.telnyx_sip_host,
+                sip_port=self.settings.telnyx_sip_port,
+                sip_username=self.settings.telnyx_sip_username,
+                sip_password=self.settings.telnyx_sip_password,
+                caller_number=self.settings.outbound_caller_number,
+                target_number=normalized_to,
+            )
+            session.sip_handle = handle
+            session.provider = "telnyx_sip"
+            session.provider_call_id = sip_cid
+            handle.start_background()
+        else:
+            dial_info = await self.telephony.dial_outbound(call_id, phone_number)
+            session.provider = dial_info["provider"]
+            session.provider_call_id = dial_info["provider_call_id"]
 
         wait_timeout = (
             timeout_seconds
@@ -435,9 +460,12 @@ class CallBridgeManager:
         session.human_finished_speaking.clear()
         ws_url = f"{self.settings.public_wss_base}/ws/media/{call_id}"
 
-        sent = await self.telephony.send_dtmf(
-            session.provider_call_id, digits, ws_url, call_id
-        )
+        if session.sip_handle is not None:
+            sent = await session.sip_handle.send_dtmf(digits)
+        else:
+            sent = await self.telephony.send_dtmf(
+                session.provider_call_id, digits, ws_url, call_id
+            )
         session.record_turn("system", f"[Sent DTMF digits: {digits}]")
 
         if not listen_after:
@@ -465,7 +493,10 @@ class CallBridgeManager:
         if parting_words.strip() and session.status == "connected":
             await session.enqueue_tts_and_wait(parting_words)
 
-        await self.telephony.hangup(session.provider_call_id)
+        if session.sip_handle is not None:
+            await session.sip_handle.hangup()
+        else:
+            await self.telephony.hangup(session.provider_call_id)
         session.mark_terminated("completed")
         saved_path = self.persist_session(session)
         result = session.to_dict()

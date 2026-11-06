@@ -24,15 +24,29 @@ class Settings:
         default_factory=lambda: os.getenv("WEBHOOK_SIGNING_SECRET", "")
     )
 
-    # Telephony Provider: "telnyx" (default, ~50% cheaper) or "twilio"
+    # Telephony Provider: "telnyx_sip" (default, zero Cloudflare/webhooks needed), "telnyx", or "twilio"
     telephony_provider: str = field(
-        default_factory=lambda: os.getenv("TELEPHONY_PROVIDER", "telnyx").lower().strip()
+        default_factory=lambda: os.getenv("TELEPHONY_PROVIDER", "telnyx_sip").lower().strip()
     )
     outbound_caller_number: str = field(
         default_factory=lambda: os.getenv("OUTBOUND_CALLER_NUMBER", "")
     )
 
-    # Telnyx Configuration ($1.00/mo number, ~$0.007/min outbound + media streaming)
+    # Telnyx Direct Outbound SIP Credentials (No public webhook/Cloudflare needed)
+    telnyx_sip_host: str = field(
+        default_factory=lambda: os.getenv("TELNYX_SIP_HOST", "sip.telnyx.com")
+    )
+    telnyx_sip_port: int = field(
+        default_factory=lambda: int(os.getenv("TELNYX_SIP_PORT", "5060"))
+    )
+    telnyx_sip_username: str = field(
+        default_factory=lambda: os.getenv("TELNYX_SIP_USERNAME", "")
+    )
+    telnyx_sip_password: str = field(
+        default_factory=lambda: os.getenv("TELNYX_SIP_PASSWORD", "")
+    )
+
+    # Telnyx Configuration ($1.00/mo number, ~$0.005-$0.007/min outbound)
     telnyx_api_key: str = field(default_factory=lambda: os.getenv("TELNYX_API_KEY", ""))
     telnyx_connection_id: str = field(
         default_factory=lambda: os.getenv("TELNYX_CONNECTION_ID", "")
