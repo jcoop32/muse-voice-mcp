@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: muse-voice-mcp
+  namespace: default
+  labels:
+    app: muse-voice-mcp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: muse-voice-mcp
+  template:
+    metadata:
+      labels:
+        app: muse-voice-mcp
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: muse-voice-mcp
+          image: jcooper23/muse-voice-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: ENVIRONMENT
+              value: "production"
+            - name: PORT
+              value: "8090"
+            - name: PUBLIC_DOMAIN
+              value: "voice-mcp.cooperlabs.app"
+            - name: DATA_DIR
+              value: "/data"
+            - name: WHISPER_MODEL_SIZE
+              value: "base.en"
+            - name: WHISPER_DEVICE
+              value: "cpu"
+            - name: WHISPER_COMPUTE_TYPE
+              value: "int8"
+            - name: TTS_ENGINE
+              value: "piper"
+            - name: PIPER_VOICE_MODEL
+              value: "en_US-lessac-medium"
+            - name: FILLER_DELAY_SECONDS
+              value: "1.25"
+          envFrom:
+            - secretRef:
+                name: muse-voice-secrets
+          volumeMounts:
+            - name: voice-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: voice-data
+          persistentVolumeClaim:
+            claimName: muse-voice-data-pvc

@@ -1,0 +1,17 @@
+services:
+  muse-voice-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/data
+    volumes:
+      - muse_voice_data:/data
+    restart: unless-stopped
+
+volumes:
+  muse_voice_data:
