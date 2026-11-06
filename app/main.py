@@ -65,9 +65,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        if manager.stt.custom_transcribe_fn is None:
+        if getattr(manager.stt, "_custom_transcribe_fn", None) is None:
             asyncio.create_task(asyncio.to_thread(manager.stt.warmup))
-        if manager.tts._custom_synth_fn is None:
+        if getattr(manager.tts, "_custom_synth_fn", None) is None:
             asyncio.create_task(manager.tts.synthesize_mulaw_frames("Hey there!"))
         yield
 

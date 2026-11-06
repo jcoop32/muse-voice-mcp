@@ -33,16 +33,15 @@ def test_health_and_twiml_webhooks(tmp_path: Path) -> None:
     )
     manager = CallBridgeManager(settings=settings, stt=stt, tts=tts)
     app = create_app(settings=settings, bridge_manager=manager)
-    client = TestClient(app)
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json()["telephony_provider"] == "telnyx"
 
-    health = client.get("/healthz")
-    assert health.status_code == 200
-    assert health.json()["telephony_provider"] == "telnyx"
-
-    twiml = client.post("/webhooks/telephony/twiml/call_abc123")
-    assert twiml.status_code == 200
-    assert "wss://voice-mcp.cooperlabs.app/ws/media/call_abc123" in twiml.text
-    assert 'bidirectionalMode="rtp"' in twiml.text
+        twiml = client.post("/webhooks/telephony/twiml/call_abc123")
+        assert twiml.status_code == 200
+        assert "wss://voice-mcp.cooperlabs.app/ws/media/call_abc123" in twiml.text
+        assert 'bidirectionalMode="rtp"' in twiml.text
 
 
 def test_websocket_media_stream_and_barge_in(tmp_path: Path) -> None:
