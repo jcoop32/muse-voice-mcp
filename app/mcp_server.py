@@ -32,13 +32,28 @@ def create_mcp_server(bridge_manager: CallBridgeManager) -> FastMCP:
         call_context: str = "",
         opening_line: str = "",
         timeout_seconds: float = 45.0,
+        auto_converse: bool = False,
     ) -> dict[str, Any]:
-        """Dial an external phone number (E.164 or 10-digit US), wait for them to answer, optionally speak `opening_line` immediately with zero delay, and return what they said."""
+        """Dial an external phone number (E.164 or 10-digit US), navigate call screening automatically, enforce caller-ID trust (+12242458826 = trusted owner, all others = untrusted external sandbox), optionally speak `opening_line` immediately, and return what they said."""
         return await bridge_manager.start_call(
             phone_number=phone_number,
             call_context=call_context,
             timeout_seconds=timeout_seconds,
             opening_line=opening_line,
+            auto_converse=auto_converse,
+        )
+
+    @mcp.tool()
+    async def converse_on_phone(
+        call_id: str,
+        max_turns: int = 12,
+        listen_timeout_seconds: float = 25.0,
+    ) -> dict[str, Any]:
+        """Have a fast, natural, multi-turn conversation on the active phone call using the in-pod VoiceBrain (open-ended companion chat for +12242458826; air-gapped zero-tool sandbox for external numbers)."""
+        return await bridge_manager.converse_on_phone(
+            call_id=call_id,
+            max_turns=max_turns,
+            listen_timeout_seconds=listen_timeout_seconds,
         )
 
     @mcp.tool()

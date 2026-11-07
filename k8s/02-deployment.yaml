@@ -58,6 +58,10 @@ spec:
               value: "420"
             - name: FILLER_DELAY_SECONDS
               value: "0.0"
+            - name: OWNER_PHONE_NUMBERS
+              value: "+12242458826"
+            - name: VOICE_BRAIN_MODEL
+              value: "google/gemini-2.5-flash"
           envFrom:
             - secretRef:
                 name: muse-voice-secrets

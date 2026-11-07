@@ -109,6 +109,19 @@ class Settings:
         default_factory=lambda: float(os.getenv("DEFAULT_LISTEN_TIMEOUT_SECONDS", "25.0"))
     )
 
+    # Security & Conversational Brain (Owner Trust Boundary + Air-Gapped Sandbox)
+    owner_phone_numbers: str = field(
+        default_factory=lambda: os.getenv("OWNER_PHONE_NUMBERS", "+12242458826")
+    )
+    openrouter_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
+    )
+    voice_brain_model: str = field(
+        default_factory=lambda: os.getenv(
+            "VOICE_BRAIN_MODEL", "google/gemini-2.5-flash"
+        )
+    )
+
     # Persistent Storage (Longhorn PVC mounted at /data)
     data_dir: Path = field(
         default_factory=lambda: Path(os.getenv("DATA_DIR", "/tmp/muse-voice-data"))

@@ -16,11 +16,20 @@ from fastapi import WebSocket
 
 from app.audio_codec import mulaw_b64_to_float32_16k
 from app.config import Settings
+from app.security_guard import (
+    TrustProfile,
+    classify_answering_system,
+    classify_call_trust,
+    detect_goodbye_intent,
+    filter_outbound_speech_dlp,
+    sanitize_for_muse_llm,
+)
 from app.sip_client import SipCallHandle
 from app.stt import LocalWhisperSTT
 from app.telephony import TelephonyDriver, normalize_phone_number
 from app.tts import LocalTTSEngine
 from app.vad import UtteranceTracker
+from app.voice_brain import VoiceBrain, split_into_speakable_clauses
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +76,16 @@ class CallSession:
         self.created_at: float = time.time()
         self.ended_at: float | None = None
         self.summary_for_user: str = ""
+
+        # Security & Conversational Trust Profile (+12242458826 Owner vs. External Untrusted)
+        self.trust_profile: TrustProfile = classify_call_trust(
+            phone_number, settings.owner_phone_numbers
+        )
+        self.trust_level: str = self.trust_profile.trust_level
+        self.allow_sensitive_tools: bool = self.trust_profile.allow_sensitive_tools
+        self.conversation_mode: str = self.trust_profile.conversation_mode
+        self.answering_state: str = "unknown"  # unknown, human, call_screener, voicemail
+        self.security_events: list[str] = []
 
         self.transcript: list[TranscriptEntry] = []
         self.latest_remote_utterance: str = ""
@@ -130,14 +149,22 @@ class CallSession:
         self._filler_task = asyncio.create_task(_delayed_filler())
 
     async def enqueue_tts_and_wait(self, text: str) -> None:
-        """Synthesize text via local TTS, stream to the phone line, and wait until spoken."""
+        """Synthesize text (with Outbound DLP & sentence streaming), stream to the phone line, and wait until spoken."""
         self.cancel_pending_filler()
         cleaned = text.strip()
         if not cleaned:
             return
-        self.record_turn("muse", cleaned)
-        frames = await self.tts.synthesize_mulaw_frames(cleaned)
-        if not frames or (self.websocket is None and self.sip_handle is None):
+
+        # Outbound DLP Guard: block accidental secret/account leakage on external untrusted calls
+        safe_text, dlp_redacted = filter_outbound_speech_dlp(
+            cleaned, trust_level=self.trust_level, call_context=self.call_context
+        )
+        if dlp_redacted:
+            self.security_events.append("outbound_dlp_redacted")
+
+        self.record_turn("muse", safe_text)
+        if self.websocket is None and self.sip_handle is None:
+            await self.tts.synthesize_mulaw_frames(safe_text)
             return
 
         # Drain any stale filler items in the outbound queue and preempt active filler playback
@@ -157,14 +184,34 @@ class CallSession:
         if self.is_playing_tts:
             self.abort_current_playback = True
 
-        item = OutboundAudioItem(frames_b64=frames, label="muse_turn")
-        await self.outbound_queue.put(item)
-        # Wait for the WebSocket/RTP sender loop to finish streaming (or call termination)
-        done_wait = asyncio.create_task(item.done_event.wait())
+        # Sentence-chunked streaming: synthesize clause 1 and immediately start playback while clause 2+ synthesizes
+        clauses = split_into_speakable_clauses(safe_text)
+        if not clauses:
+            return
+
+        synth_tasks = [
+            asyncio.create_task(self.tts.synthesize_mulaw_frames(clause))
+            for clause in clauses
+        ]
+        queued_items: list[OutboundAudioItem] = []
+        total_frames = 0
+        for task in synth_tasks:
+            frames = await task
+            if frames:
+                total_frames += len(frames)
+                item = OutboundAudioItem(frames_b64=frames, label="muse_turn")
+                queued_items.append(item)
+                await self.outbound_queue.put(item)
+
+        if not queued_items:
+            return
+
+        last_item = queued_items[-1]
+        done_wait = asyncio.create_task(last_item.done_event.wait())
         term_wait = asyncio.create_task(self.call_terminated.wait())
         await asyncio.wait(
             {done_wait, term_wait},
-            timeout=max(5.0, len(frames) * 0.025 + 3.0),
+            timeout=max(5.0, total_frames * 0.025 + 3.0),
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in (done_wait, term_wait):
@@ -258,6 +305,14 @@ class CallSession:
                 timeout=greeting_wait,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # CRITICAL: If the remote speaker / call screener / voicemail is actively talking right now,
+            # do NOT cut them off—wait until they finish their current sentence!
+            if not done2 and self.utterance_tracker.in_speech:
+                done2, pending2 = await asyncio.wait(
+                    {speech_task, term_task},
+                    timeout=min(12.0, max(3.0, answer_timeout_seconds - greeting_wait)),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             for t in pending2:
                 t.cancel()
             if speech_task in done2:
@@ -306,6 +361,29 @@ class CallSession:
         except Exception:
             pass
 
+    def security_envelope(self, raw_remote_text: str) -> dict[str, Any]:
+        """Build the standardized trust, prompt-injection firewall, and conversation metadata for Muse."""
+        safe_text, was_flagged, reason = sanitize_for_muse_llm(
+            raw_remote_text, self.trust_level
+        )
+        if was_flagged and reason:
+            self.security_events.append(reason)
+        sys_type = classify_answering_system(raw_remote_text)
+        if sys_type in ("voicemail", "call_screener_prompt", "call_screener_hold"):
+            self.answering_state = sys_type
+        elif raw_remote_text.strip() and self.answering_state == "unknown":
+            self.answering_state = "human"
+        return {
+            "they_said": safe_text,
+            "trust_level": self.trust_level,
+            "conversation_mode": self.conversation_mode,
+            "allow_sensitive_tools": self.allow_sensitive_tools,
+            "answering_state": self.answering_state,
+            "goodbye_detected": detect_goodbye_intent(raw_remote_text),
+            "prompt_injection_blocked": was_flagged,
+            "security_directive": self.trust_profile.security_directive,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         duration = round((self.ended_at or time.time()) - self.created_at, 2)
         return {
@@ -315,6 +393,11 @@ class CallSession:
             "provider": self.provider,
             "provider_call_id": self.provider_call_id,
             "status": self.status,
+            "trust_level": self.trust_level,
+            "conversation_mode": self.conversation_mode,
+            "allow_sensitive_tools": self.allow_sensitive_tools,
+            "answering_state": self.answering_state,
+            "security_events": list(self.security_events),
             "duration_seconds": duration,
             "summary_for_user": self.summary_for_user,
             "latest_remote_utterance": self.latest_remote_utterance,
@@ -338,6 +421,7 @@ class CallBridgeManager:
         stt: LocalWhisperSTT | None = None,
         tts: LocalTTSEngine | None = None,
         telephony: TelephonyDriver | None = None,
+        voice_brain: VoiceBrain | None = None,
     ) -> None:
         self.settings = settings
         self.stt = stt or LocalWhisperSTT(
@@ -354,6 +438,10 @@ class CallBridgeManager:
             models_dir=settings.models_dir,
         )
         self.telephony = telephony or TelephonyDriver(settings)
+        self.voice_brain = voice_brain or VoiceBrain(
+            api_key=settings.openrouter_api_key,
+            model=settings.voice_brain_model,
+        )
         self.sessions: dict[str, CallSession] = {}
 
     def get_session(self, call_id: str) -> CallSession:
@@ -362,14 +450,51 @@ class CallBridgeManager:
             raise KeyError(f"Unknown call_id '{call_id}'.")
         return session
 
+    async def _navigate_call_screener_if_needed(
+        self, session: CallSession, initial_greeting: str
+    ) -> tuple[str, str]:
+        """Automatically handle iOS/Android Call Screening ('record your name' -> 'please stay on the line')."""
+        current_text = initial_greeting
+        for _ in range(3):
+            sys_state = classify_answering_system(current_text)
+            if sys_state == "call_screener_prompt":
+                session.answering_state = "call_screener"
+                session.human_finished_speaking.clear()
+                await session.enqueue_tts_and_wait(
+                    "Hi, it's Bernard calling on behalf of Joshua Cooper."
+                )
+                outcome, next_text = await session.wait_for_remote_reply(
+                    timeout_seconds=35.0, arm_filler_on_speech=False
+                )
+                if outcome != "replied":
+                    return outcome, current_text
+                current_text = next_text
+                continue
+
+            if sys_state == "call_screener_hold":
+                session.answering_state = "call_screener"
+                session.human_finished_speaking.clear()
+                # Wait silently through the screening hold until the real human picks up
+                outcome, next_text = await session.wait_for_remote_reply(
+                    timeout_seconds=35.0, arm_filler_on_speech=False
+                )
+                if outcome != "replied":
+                    return outcome, current_text
+                current_text = next_text
+                continue
+
+            break
+        return "replied", current_text
+
     async def start_call(
         self,
         phone_number: str,
         call_context: str = "",
         timeout_seconds: float | None = None,
         opening_line: str = "",
+        auto_converse: bool = False,
     ) -> dict[str, Any]:
-        """Dial an external number, wait for their initial greeting, and optionally speak opening_line immediately."""
+        """Dial an external number, handle call screening, enforce caller-ID trust, and optionally start conversation."""
         call_id = f"call_{uuid.uuid4().hex[:10]}"
         session = CallSession(
             call_id=call_id,
@@ -423,7 +548,7 @@ class CallBridgeManager:
 
         outcome, greeting = await session.wait_for_answer_and_greeting(
             answer_timeout_seconds=wait_timeout,
-            post_pickup_greeting_seconds=2.8 if opening_line.strip() else 3.5,
+            post_pickup_greeting_seconds=3.2 if opening_line.strip() else 3.8,
         )
         if prewarm_task is not None and not prewarm_task.done():
             try:
@@ -433,15 +558,39 @@ class CallBridgeManager:
 
         if outcome == "ended":
             self.persist_session(session)
-            return {
+            res = {
                 "call_id": call_id,
                 "status": session.status,
                 "provider": session.provider,
-                "they_said": greeting,
                 "message": f"Call ended during dialing with status '{session.status}'.",
             }
+            res.update(session.security_envelope(greeting))
+            return res
 
-        # If an opening_line was provided and the line connected, immediately speak it and listen for their reply
+        # If a call screener answered ("record your name" / "please stay on the line"), navigate it automatically
+        if outcome == "replied" and greeting:
+            outcome, greeting = await self._navigate_call_screener_if_needed(
+                session, greeting
+            )
+
+        # Check if the call went to voicemail
+        if classify_answering_system(greeting) == "voicemail":
+            session.status = "connected"
+            session.answering_state = "voicemail"
+            res = {
+                "call_id": call_id,
+                "status": "voicemail",
+                "provider": session.provider,
+                "next_action_hint": (
+                    "VOICEMAIL DETECTED: The person did not pick up live—their voicemail answered. "
+                    "Either call end_phone_call(call_id, parting_words='') to hang up without leaving a message, "
+                    "or call speak_and_listen/end_phone_call with a voicemail message."
+                ),
+            }
+            res.update(session.security_envelope(greeting))
+            return res
+
+        # If an opening_line was provided and a live person answered, speak it immediately and listen for their reply
         if opening_line.strip() and outcome in ("replied", "connected_silent"):
             session.status = "connected"
             session.human_finished_speaking.clear()
@@ -450,45 +599,52 @@ class CallBridgeManager:
                 timeout_seconds=self.settings.default_listen_timeout_seconds,
                 arm_filler_on_speech=False,
             )
-            return {
+            effective_text = first_reply or greeting
+            if auto_converse and reply_outcome == "replied":
+                return await self.converse_on_phone(call_id=call_id)
+            res = {
                 "call_id": call_id,
                 "status": "connected" if reply_outcome == "replied" else reply_outcome,
                 "provider": session.provider,
                 "initial_greeting": greeting,
                 "opening_line_spoken": opening_line.strip(),
-                "they_said": first_reply or greeting,
                 "next_action_hint": (
-                    "Respond naturally with speak_and_listen(call_id, what_to_say). "
-                    "IMPORTANT: Do NOT hang up immediately after getting the info—acknowledge their answer, "
-                    "ask if there is anything else or wrap up naturally before calling end_phone_call."
+                    "Call converse_on_phone(call_id) for fast, natural multi-turn conversation, "
+                    "or speak_and_listen(call_id, what_to_say) to reply turn-by-turn. "
+                    "IMPORTANT: Do NOT hang up abruptly—keep the conversation natural until a real goodbye."
                 ),
             }
+            res.update(session.security_envelope(effective_text))
+            return res
 
         if outcome == "replied":
             session.status = "connected"
-            return {
+            if auto_converse:
+                return await self.converse_on_phone(call_id=call_id)
+            res = {
                 "call_id": call_id,
                 "status": "connected",
                 "provider": session.provider,
-                "they_said": greeting,
                 "next_action_hint": (
-                    "Call speak_and_listen(call_id, what_to_say) to respond, "
-                    "send_dtmf(call_id, digits) if facing an automated menu. "
-                    "IMPORTANT: Do NOT hang up immediately after getting the info—keep the conversation "
-                    "natural and wrap up politely before calling end_phone_call."
+                    "Call converse_on_phone(call_id) for fast, natural multi-turn conversation, "
+                    "or speak_and_listen(call_id, what_to_say) to respond. "
+                    "IMPORTANT: Do NOT hang up immediately after getting info—keep the conversation natural."
                 ),
             }
+            res.update(session.security_envelope(greeting))
+            return res
 
-        return {
+        res = {
             "call_id": call_id,
             "status": "connected_silent",
             "provider": session.provider,
-            "they_said": "",
             "next_action_hint": (
                 "Line connected with no initial greeting. "
                 "Call speak_and_listen(call_id, 'Hey there!') immediately to greet them."
             ),
         }
+        res.update(session.security_envelope(""))
+        return res
 
     async def speak_and_listen(
         self,
@@ -497,7 +653,7 @@ class CallBridgeManager:
         listen_timeout_seconds: float | None = None,
         play_filler_after_reply: bool = False,
     ) -> dict[str, Any]:
-        """Speak Muse's line over the phone, wait for the person to reply, and return their words."""
+        """Speak Muse's line over the phone, wait for the person to reply, and return their sanitized words."""
         session = self.get_session(call_id)
         session.human_finished_speaking.clear()
 
@@ -513,33 +669,131 @@ class CallBridgeManager:
             arm_filler_on_speech=play_filler_after_reply,
         )
 
+        # If a call screener put us on hold ("Thank you. Please stay on the line."), wait for the real human!
+        if outcome == "replied" and classify_answering_system(reply_text) == "call_screener_hold":
+            session.answering_state = "call_screener"
+            session.human_finished_speaking.clear()
+            outcome, reply_text = await session.wait_for_remote_reply(
+                timeout_seconds=35.0,
+                arm_filler_on_speech=False,
+            )
+
         if outcome == "replied":
-            return {
+            res = {
                 "call_id": call_id,
                 "status": "replied",
-                "they_said": reply_text,
                 "next_action_hint": (
-                    "Continue the conversation naturally with speak_and_listen(call_id, what_to_say). "
-                    "Do NOT hang up abruptly as soon as you get an answer—acknowledge what they said "
-                    "and let the conversation close naturally before calling end_phone_call."
+                    "Continue the conversation naturally with speak_and_listen(call_id, what_to_say) "
+                    "or converse_on_phone(call_id). Do NOT hang up unless goodbye_detected is True "
+                    "or you have naturally wrapped up the conversation."
                 ),
             }
+            res.update(session.security_envelope(reply_text))
+            return res
         if outcome == "ended":
             self.persist_session(session)
-            return {
+            res = {
                 "call_id": call_id,
                 "status": "call_ended_by_remote",
-                "they_said": reply_text,
             }
-        return {
+            res.update(session.security_envelope(reply_text))
+            return res
+        res = {
             "call_id": call_id,
             "status": "on_hold_or_silence",
-            "they_said": "",
             "hint": (
                 f"No speech detected for {wait_timeout:.0f}s (person may be checking or holding). "
                 "Call wait_on_hold(call_id) to continue listening, or speak_and_listen to check in."
             ),
         }
+        res.update(session.security_envelope(""))
+        return res
+
+    async def converse_on_phone(
+        self,
+        call_id: str,
+        max_turns: int = 12,
+        listen_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Run a low-latency, natural multi-turn voice conversation using the in-pod VoiceBrain.
+
+        - For +12242458826 (Owner): Open-ended casual conversation; yields to Muse only if an external tool is requested.
+        - For External Numbers: Air-gapped zero-tool sandbox strictly scoped to call_context with prompt-injection & DLP firewall.
+        """
+        session = self.get_session(call_id)
+        wait_timeout = (
+            listen_timeout_seconds
+            if listen_timeout_seconds is not None
+            else self.settings.default_listen_timeout_seconds
+        )
+
+        turns_completed = 0
+        while turns_completed < max_turns and session.status == "connected":
+            turns_completed += 1
+            history_dicts = [
+                {"speaker": t.speaker, "text": t.text} for t in session.transcript
+            ]
+            decision = await self.voice_brain.generate_turn_reply(
+                trust_level=session.trust_level,
+                call_context=session.call_context,
+                transcript_history=history_dicts,
+                latest_remote_text=session.latest_remote_utterance,
+            )
+            if decision.blocked_injection and decision.injection_reason:
+                session.security_events.append(decision.injection_reason)
+
+            if decision.needs_owner_tool_handoff:
+                await session.enqueue_tts_and_wait(decision.spoken_reply)
+                res = {
+                    "call_id": call_id,
+                    "status": "owner_tool_handoff_requested",
+                    "tool_handoff_request": decision.tool_handoff_request,
+                    "next_action_hint": (
+                        "Verified owner (+12242458826) requested an action requiring your tools. "
+                        "Execute the requested tool, then call speak_and_listen(call_id, result) to tell Joshua!"
+                    ),
+                }
+                res.update(session.security_envelope(session.latest_remote_utterance))
+                return res
+
+            if decision.should_end_call:
+                return await self.end_call(
+                    call_id=call_id,
+                    parting_words=decision.spoken_reply,
+                    summary_for_user=f"Completed natural {session.conversation_mode} conversation.",
+                )
+
+            session.human_finished_speaking.clear()
+            await session.enqueue_tts_and_wait(decision.spoken_reply)
+            outcome, reply_text = await session.wait_for_remote_reply(
+                timeout_seconds=wait_timeout, arm_filler_on_speech=False
+            )
+            if outcome == "ended":
+                self.persist_session(session)
+                res = {
+                    "call_id": call_id,
+                    "status": "call_ended_by_remote",
+                }
+                res.update(session.security_envelope(reply_text))
+                return res
+            if outcome != "replied":
+                res = {
+                    "call_id": call_id,
+                    "status": "on_hold_or_silence",
+                }
+                res.update(session.security_envelope(""))
+                return res
+
+        res = {
+            "call_id": call_id,
+            "status": "replied",
+            "turns_completed": turns_completed,
+            "next_action_hint": (
+                "Call converse_on_phone(call_id) to continue the conversation or end_phone_call(call_id) when done."
+            ),
+        }
+        res.update(session.security_envelope(session.latest_remote_utterance))
+        return res
 
     async def wait_on_hold(
         self, call_id: str, timeout_seconds: float = 30.0

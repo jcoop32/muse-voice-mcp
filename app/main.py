@@ -31,6 +31,15 @@ class StartCallRequest(BaseModel):
         description="Optional opening line to pre-synthesize while ringing and speak immediately upon pickup",
     )
     timeout_seconds: float = Field(default=45.0, ge=1.0, le=120.0)
+    auto_converse: bool = Field(
+        default=False,
+        description="If True, immediately enter low-latency multi-turn conversation mode after pickup",
+    )
+
+
+class ConverseRequest(BaseModel):
+    max_turns: int = Field(default=12, ge=1, le=50)
+    listen_timeout_seconds: float = Field(default=25.0, ge=1.0, le=120.0)
 
 
 class SpeakAndListenRequest(BaseModel):
@@ -193,7 +202,21 @@ def create_app(
             call_context=req.call_context,
             timeout_seconds=req.timeout_seconds,
             opening_line=req.opening_line,
+            auto_converse=req.auto_converse,
         )
+
+    @app.post("/api/v1/calls/{call_id}/converse")
+    async def api_converse_on_phone(
+        call_id: str, req: ConverseRequest
+    ) -> dict[str, Any]:
+        try:
+            return await manager.converse_on_phone(
+                call_id=call_id,
+                max_turns=req.max_turns,
+                listen_timeout_seconds=req.listen_timeout_seconds,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/v1/calls/{call_id}/speak")
     async def api_speak_and_listen(
