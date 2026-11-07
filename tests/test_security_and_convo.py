@@ -108,7 +108,11 @@ async def test_automatic_call_screener_navigation(tmp_path: Path) -> None:
         call_id = next(iter(manager.sessions.keys()))
         session = manager.get_session(call_id)
         session.status = "connected"
+        session.utterance_tracker.is_speaking = True
+        session.ws_connected.set()
+        await asyncio.sleep(0.05)
         # Step 1: iOS Screener asks for name and reason
+        session.utterance_tracker.is_speaking = False
         session.record_turn(
             "remote",
             "Hi, if you record your name and reason for calling, I'll see if this person is available.",

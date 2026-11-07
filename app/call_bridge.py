@@ -307,7 +307,7 @@ class CallSession:
             )
             # CRITICAL: If the remote speaker / call screener / voicemail is actively talking right now,
             # do NOT cut them off—wait until they finish their current sentence!
-            if not done2 and self.utterance_tracker.in_speech:
+            if not done2 and self.utterance_tracker.is_speaking:
                 done2, pending2 = await asyncio.wait(
                     {speech_task, term_task},
                     timeout=min(12.0, max(3.0, answer_timeout_seconds - greeting_wait)),

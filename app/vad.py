@@ -62,6 +62,10 @@ class UtteranceTracker:
     _buffer: list[np.ndarray] = field(default_factory=list)
     _pre_roll: list[np.ndarray] = field(default_factory=list)
 
+    @property
+    def in_speech(self) -> bool:
+        return self.is_speaking
+
     def reset(self) -> None:
         self.is_speaking = False
         self.speech_samples = 0
